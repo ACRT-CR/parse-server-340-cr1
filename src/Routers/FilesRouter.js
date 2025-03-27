@@ -1,5 +1,4 @@
 import express from 'express';
-import BodyParser from 'body-parser';
 import * as Middlewares from '../middlewares';
 import Parse from 'parse/node';
 import Config from '../Config';
@@ -7,6 +6,7 @@ import logger from '../logger';
 const triggers = require('../triggers');
 const http = require('http');
 const Utils = require('../Utils');
+const auth = require('../Auth');
 
 const downloadFileFromURI = uri => {
   return new Promise((res, rej) => {
@@ -45,7 +45,7 @@ export class FilesRouter {
 
     router.post(
       '/files/:filename',
-      BodyParser.raw({
+      express.raw({
         type: () => {
           return true;
         },
@@ -66,6 +66,22 @@ export class FilesRouter {
     return router;
   }
 
+  static async _resolveAuth(req, config) {
+    const sessionToken = req.get('X-Parse-Session-Token');
+    if (!sessionToken) {
+      return null;
+    }
+    try {
+      return await auth.getAuthForSessionToken({
+        config,
+        sessionToken,
+        installationId: req.get('X-Parse-Installation-Id'),
+      });
+    } catch {
+      return null;
+    }
+  }
+
   async getHandler(req, res) {
     const config = Config.get(req.params.appId);
     if (!config) {
@@ -81,11 +97,12 @@ export class FilesRouter {
       const mime = (await import('mime')).default;
       let contentType = mime.getType(filename);
       let file = new Parse.File(filename, { base64: '' }, contentType);
+      const fileAuth = await FilesRouter._resolveAuth(req, config);
       const triggerResult = await triggers.maybeRunFileTrigger(
         triggers.Types.beforeFind,
         { file },
         config,
-        req.auth
+        fileAuth
       );
       if (triggerResult?.file?._name) {
         filename = triggerResult?.file?._name;
@@ -93,6 +110,15 @@ export class FilesRouter {
       }
 
       if (isFileStreamable(req, filesController)) {
+        const afterFind = await triggers.maybeRunFileTrigger(
+          triggers.Types.afterFind,
+          { file, forceDownload: false },
+          config,
+          fileAuth
+        );
+        if (afterFind?.forceDownload) {
+          res.set('Content-Disposition', `attachment;filename=${afterFind.file?._name || filename}`);
+        }
         filesController.handleFileStream(config, filename, req, res, contentType).catch(() => {
           res.status(404);
           res.set('Content-Type', 'text/plain');
@@ -114,7 +140,7 @@ export class FilesRouter {
         triggers.Types.afterFind,
         { file, forceDownload: false },
         config,
-        req.auth
+        fileAuth
       );
 
       if (afterFind?.file) {
@@ -335,8 +361,25 @@ export class FilesRouter {
     try {
       const config = Config.get(req.params.appId);
       const { filesController } = config;
-      const { filename } = req.params;
+      let { filename } = req.params;
+      const file = new Parse.File(filename, { base64: '' });
+      const fileAuth = await FilesRouter._resolveAuth(req, config);
+      const triggerResult = await triggers.maybeRunFileTrigger(
+        triggers.Types.beforeFind,
+        { file },
+        config,
+        fileAuth
+      );
+      if (triggerResult?.file?._name) {
+        filename = triggerResult.file._name;
+      }
       const data = await filesController.getMetadata(filename);
+      await triggers.maybeRunFileTrigger(
+        triggers.Types.afterFind,
+        { file },
+        config,
+        fileAuth
+      );
       res.status(200);
       res.json(data);
     } catch (e) {
